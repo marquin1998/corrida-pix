@@ -1,74 +1,99 @@
-import fetch from "node-fetch";
+// api/pix.js
+import fetch from "node-fetch"; // ok em Vercel; se der ruim, remova essa linha (Node 18 tem fetch global)
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*", // em produção prefira colocar apenas seu domínio
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+};
 
 export default async function handler(req, res) {
+  // Responder preflight OPTIONS
+  if (req.method === "OPTIONS") {
+    Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
+    return res.status(204).end();
+  }
+
+  // Adiciona CORS em todas as respostas
+  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
+
+  // GET de teste para confirmar que a rota está acessível
+  if (req.method === "GET") {
+    return res.status(200).json({ ok: true, message: "API pix funcionando" });
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Método não permitido" });
   }
 
-  const { nome, email, valor } = req.body;
-
+  // Validação mínima
+  const { nome, email, valor } = req.body || {};
   if (!nome || !email || !valor) {
-    return res.status(400).json({ error: "Dados incompletos" });
+    return res.status(400).json({ error: "Dados incompletos (nome, email, valor)" });
+  }
+
+  // Verifica variáveis de ambiente
+  if (!process.env.GN_CLIENT_ID || !process.env.GN_CLIENT_SECRET || !process.env.GN_PIX_KEY) {
+    return res.status(500).json({ error: "Variáveis de ambiente Gerencianet não configuradas" });
   }
 
   try {
-    // 1. Pega token OAuth da Gerencianet
-    const credentials = Buffer.from(
-      `${process.env.GN_CLIENT_ID}:${process.env.GN_CLIENT_SECRET}`
-    ).toString("base64");
-
-    const authResponse = await fetch("https://api-pix.gerencianet.com.br/oauth/token", {
+    // -- Autenticação Gerencianet (exemplo) --
+    const credentials = Buffer.from(`${process.env.GN_CLIENT_ID}:${process.env.GN_CLIENT_SECRET}`).toString("base64");
+    const authResp = await fetch("https://api-pix.gerencianet.com.br/oauth/token", {
       method: "POST",
-      headers: {
-        "Authorization": `Basic ${credentials}`,
-        "Content-Type": "application/json"
-      },
+      headers: { Authorization: `Basic ${credentials}`, "Content-Type": "application/json" },
       body: JSON.stringify({ grant_type: "client_credentials" })
     });
+    if (!authResp.ok) {
+      const t = await authResp.text();
+      throw new Error("Auth falhou: " + t);
+    }
+    const authJson = await authResp.json();
+    const accessToken = authJson.access_token;
 
-    const { access_token } = await authResponse.json();
-
-    // 2. Cria cobrança Pix
-    const txid = "cdm" + Date.now(); // ID único por cobrança
-    const chargeResponse = await fetch(`https://api-pix.gerencianet.com.br/v2/cob/${txid}`, {
+    // Exemplo: criar cobrança (ajuste conforme API atual da Gerencianet)
+    const txid = "cdm" + Date.now();
+    const createResp = await fetch(`https://api-pix.gerencianet.com.br/v2/cob/${txid}`, {
       method: "PUT",
-      headers: {
-        "Authorization": `Bearer ${access_token}`,
-        "Content-Type": "application/json"
-      },
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        calendario: { expiracao: 3600 }, // 1h para pagar
+        calendario: { expiracao: 3600 },
         devedor: { nome, email },
-        valor: { original: valor.toFixed(2) },
-        chave: process.env.GN_PIX_KEY, // sua chave Pix
-        solicitacaoPagador: "Pagamento inscrição Corrida de La Muertos"
+        valor: { original: Number(valor).toFixed(2) },
+        chave: process.env.GN_PIX_KEY,
+        solicitacaoPagador: `Inscrição Corrida de La Muertos - ${nome}`
       })
     });
 
-    const charge = await chargeResponse.json();
+    if (!createResp.ok) {
+      const t = await createResp.text();
+      throw new Error("Criar cobrança falhou: " + t);
+    }
+    const createJson = await createResp.json();
 
-    // 3. Gera QR Code
-    const qrcodeResponse = await fetch("https://api-pix.gerencianet.com.br/v2/gn/qr", {
+    // Gera QRCode
+    const qrResp = await fetch("https://api-pix.gerencianet.com.br/v2/gn/qr", {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${access_token}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ id: charge.loc.id })
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ id: createJson.loc.id })
     });
 
-    const qrcode = await qrcodeResponse.json();
+    if (!qrResp.ok) {
+      const t = await qrResp.text();
+      throw new Error("Gerar QR falhou: " + t);
+    }
+    const qrJson = await qrResp.json();
 
     return res.status(200).json({
       status: "success",
       txid,
       valor,
-      qrcode: qrcode.qrcode,
-      copiaecola: qrcode.qrCode
+      qrcode: qrJson.qrcode,
+      copiaecola: qrJson.qrCode || qrJson.copiaecola || qrJson.qr
     });
-
-  } catch (error) {
-    console.error("Erro Pix:", error);
-    return res.status(500).json({ error: "Falha ao gerar Pix" });
+  } catch (err) {
+    console.error("Erro Pix (server):", err.message || err);
+    return res.status(500).json({ error: "Falha ao gerar Pix", details: String(err.message || err) });
   }
 }
